@@ -1,31 +1,34 @@
-name: Back up Bunny storage to R2
+name: Back up Bunny storage to R2 (private)
 
 on:
   schedule:
-    # Every day at 08:00 UTC
-    - cron: '0 8 * * *'
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: s3-backup
+  group: s3-backup-prv
   cancel-in-progress: false
 
 jobs:
   backup:
     runs-on: ubuntu-latest
+    # Secrets are synced from the `prv` Doppler config to this environment
+    environment: prv
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v3
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 22
+        uses: actions/checkout@v4
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: 12
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
 
       - name: Install Node.js dependencies
         run: pnpm install --frozen-lockfile
