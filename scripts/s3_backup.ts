@@ -24,6 +24,7 @@ import {
   CopyObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -176,6 +177,16 @@ async function deleteKeys(
   }
 }
 
+/** True if an S3 error means the object does not exist. */
+function isNotFound(error: unknown): boolean {
+  const e = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+  return (
+    e?.name === `NoSuchKey` ||
+    e?.name === `NotFound` ||
+    e?.$metadata?.httpStatusCode === 404
+  );
+}
+
 function copySource(bucket: string, key: string): string {
   return `${bucket}/${encodeURIComponent(key).replace(/%2F/g, `/`)}`;
 }
@@ -278,6 +289,8 @@ async function main() {
   let done = 0;
   const total = toCopy.length + toDownload.length;
   const failures: string[] = [];
+  // Objects deleted from the source between listing and download
+  const vanished: string[] = [];
   const marker = `${SNAPSHOT_PREFIX}${today}.json`;
 
   // A same-day rerun is about to change a completed snapshot; drop its marker
@@ -286,6 +299,16 @@ async function main() {
     await deleteKeys(dst, dstBucket, [marker]);
     snapshots.complete = snapshots.complete.filter((date) => date !== today);
   }
+
+  const existsInSource = async (key: string): Promise<boolean> => {
+    try {
+      await src.send(new HeadObjectCommand({ Bucket: srcBucket, Key: key }));
+      return true;
+    } catch (error) {
+      if (isNotFound(error)) return false;
+      throw error;
+    }
+  };
 
   const transfer = async (key: string, fromPrevious: boolean) => {
     try {
@@ -317,6 +340,20 @@ async function main() {
         console.log(`[${done}/${total}]`);
       }
     } catch (error) {
+      if (!fromPrevious && isNotFound(error)) {
+        // Only skip if the object is really gone. Bunny can keep listing a
+        // file whose contents it can no longer serve; that must fail the run.
+        if (!(await existsInSource(key))) {
+          vanished.push(key);
+          console.warn(`SKIPPED ${key}: deleted from source during backup`);
+          return;
+        }
+        failures.push(key);
+        console.error(
+          `FAILED ${key}: listed on source but download returns 404 (file unreadable at source)`,
+        );
+        return;
+      }
       failures.push(key);
       console.error(`FAILED ${key}:`, (error as Error).message);
     }
@@ -325,11 +362,13 @@ async function main() {
   await runPool(toCopy, CONCURRENCY, (key) => transfer(key, true));
   await runPool(toDownload, CONCURRENCY, (key) => transfer(key, false));
 
-  if (stale.length) {
+  // Drop vanished objects too, in case an earlier run left an old copy of one
+  const toRemove = [...stale, ...vanished.filter((key) => existing.has(key))];
+  if (toRemove.length) {
     await deleteKeys(
       dst,
       dstBucket,
-      stale.map((key) => target + key),
+      toRemove.map((key) => target + key),
     );
   }
 
@@ -343,11 +382,14 @@ async function main() {
           {
             date: today,
             source: srcBucket,
-            objects: srcObjects.size,
-            bytes: totalBytes,
+            objects: srcObjects.size - vanished.length,
+            bytes:
+              totalBytes -
+              vanished.reduce((sum, key) => sum + srcObjects.get(key)!.size, 0),
             copiedFrom: previous ?? null,
             copied: toCopy.length,
-            downloaded: toDownload.length,
+            downloaded: toDownload.length - vanished.length,
+            vanished,
             completedAt: new Date().toISOString(),
           },
           null,
@@ -374,7 +416,9 @@ async function main() {
     console.log(`Pruned snapshot ${date} (${keys.length} objects)`);
   }
 
-  console.log(`Done. ${done} transferred, ${failures.length} failed.`);
+  console.log(
+    `Done. ${done} transferred, ${vanished.length} vanished, ${failures.length} failed.`,
+  );
   if (failures.length) process.exit(1);
 }
 
